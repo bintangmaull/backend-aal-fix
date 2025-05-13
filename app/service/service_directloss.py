@@ -6,10 +6,11 @@ import math
 import numpy as np
 import pandas as pd
 import logging
-from sqlalchemy.exc import IntegrityError
+
+from sqlalchemy import text 
 from app.extensions import db
 from app.models.models_database import HasilProsesDirectLoss, HasilAALProvinsi
-from app.repository.repo_directloss import get_bangunan_data, get_all_disaster_data
+from app.repository.repo_directloss import get_bangunan_data, get_all_disaster_data, get_db_connection
 
 # UTF-8 for console/logging
 sys.stdout.reconfigure(encoding='utf-8')
@@ -197,56 +198,137 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
     """
     logger.debug(f"=== START incremental recalc for {bangunan_id} ===")
 
-    bld = get_bangunan_data()
-    if 'kode_bangunan' not in bld.columns or bld['kode_bangunan'].isna().all():
-        bld['kode_bangunan'] = bld['id_bangunan'].astype(str).str.split('_').str[0].str.lower()
-    bld['jumlah_lantai'] = bld['jumlah_lantai'].fillna(0).astype(int)
-    bld['luas']          = bld['luas'].fillna(0)
-    bld['hsbgn']         = bld['hsbgn'].fillna(0)
+    # 1) Ambil data bangunan langsung dari DB
+    engine = get_db_connection()
+    with engine.connect() as conn:
+        b_query = text("""
+            SELECT
+              geom,
+              luas,
+              COALESCE(hsbgn,0) AS hsbgn,
+              COALESCE(jumlah_lantai,0) AS jumlah_lantai,
+              provinsi,
+              LOWER(split_part(id_bangunan, '_', 1)) AS kode_bangunan
+            FROM bangunan_copy
+            WHERE id_bangunan = :id
+        """)
+        b = conn.execute(b_query, {"id": bangunan_id}).mappings().first()
+        if not b:
+            raise ValueError(f"Bangunan {bangunan_id} tidak ditemukan")
 
-    row = bld[bld['id_bangunan'] == bangunan_id]
-    if row.empty:
-        raise ValueError(f"Bangunan {bangunan_id} tidak ditemukan")
-    idx = row.index[0]
-    prov      = row.loc[idx, 'provinsi']
-    kode_bgn  = row.loc[idx, 'kode_bangunan'].lower()
-    luas_val  = row.loc[idx, 'luas']
-    hsbgn_val = row.loc[idx, 'hsbgn']
-    floors_val= np.clip(row.loc[idx, 'jumlah_lantai'], 1, 2)
+        geom        = b["geom"]
+        luas_val    = b["luas"]
+        hsbgn_val   = b["hsbgn"]
+        floors_val  = int(np.clip(b["jumlah_lantai"], 1, 2))
+        prov        = b["provinsi"]
+        kode_bgn    = b["kode_bangunan"]
 
-    disaster_data = get_all_disaster_data()
-    prefix_map = {"gempa":"mmi","banjir":"depth","longsor":"mflux","gunungberapi":"kpa"}
-    scales_map = {
-      "gempa": ["500","250","100"],
-      "banjir": ["100","50","25"],
-      "longsor": ["5","2"],
-      "gunungberapi": ["250","100","50"]
-    }
-
-    direct_losses = {}
-    for name, df_raw in disaster_data.items():
-        df = df_raw.fillna(0)
-        pre = prefix_map[name]
-        for s in scales_map[name]:
-            dlc = f"direct_loss_{name}_{s}"
-            if name == "banjir":
-                y1 = df.at[idx, f"nilai_y_1_{pre}{s}"]
-                y2 = df.at[idx, f"nilai_y_2_{pre}{s}"]
-                v  = y1 if floors_val == 1 else y2
-            else:
-                ycols = [
-                    f"nilai_y_cr_{pre}{s}",
-                    f"nilai_y_mcf_{pre}{s}",
-                    f"nilai_y_mur_{pre}{s}",
-                    f"nilai_y_lightwood_{pre}{s}"
+        # 2) Mapping untuk tiap jenis bencana
+        mapping = {
+            "gempa": {
+                "raw":      "model_intensitas_gempa",
+                "dmgr":     "dmgratio_gempa",
+                "prefix":   "mmi",
+                "scales":   ["500","250","100"],
+                "threshold": 9000,
+                "vcols":    lambda pre,s: [
+                    f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
+                    f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
+                    f"h.dmgratio_mur_{pre}{s}        AS nilai_y_mur_{pre}{s}",
+                    f"h.dmgratio_lightwood_{pre}{s}  AS nilai_y_lightwood_{pre}{s}",
                 ]
-                v = df.loc[idx, ycols].max()
-            direct_losses[dlc] = float(luas_val * hsbgn_val * v or 0)
+            },
+            "banjir": {
+                "raw":      "model_intensitas_banjir",
+                "dmgr":     "dmgratio_banjir_copy",
+                "prefix":   "depth",
+                "scales":   ["100","50","25"],
+                "threshold": 750,
+                "vcols":    lambda pre,s: [
+                    f"h.dmgratio_1_{pre}{s} AS nilai_y_1_{pre}{s}",
+                    f"h.dmgratio_2_{pre}{s} AS nilai_y_2_{pre}{s}",
+                ]
+            },
+            "longsor": {
+                "raw":      "model_intensitas_longsor",
+                "dmgr":     "dmgratio_longsor",
+                "prefix":   "mflux",
+                "scales":   ["5","2"],
+                "threshold": 750,
+                "vcols":    lambda pre,s: [
+                    f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
+                    f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
+                    f"h.dmgratio_mur_{pre}{s}        AS nilai_y_mur_{pre}{s}",
+                    f"h.dmgratio_lightwood_{pre}{s}  AS nilai_y_lightwood_{pre}{s}",
+                ]
+            },
+            "gunungberapi": {
+                "raw":      "model_intensitas_gunungberapi",
+                "dmgr":     "dmgratio_gunungberapi",
+                "prefix":   "kpa",
+                "scales":   ["250","100","50"],
+                "threshold": 750,
+                "vcols":    lambda pre,s: [
+                    f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
+                    f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
+                    f"h.dmgratio_mur_{pre}{s}        AS nilai_y_mur_{pre}{s}",
+                    f"h.dmgratio_lightwood_{pre}{s}  AS nilai_y_lightwood_{pre}{s}",
+                ]
+            }
+        }
 
+        # 3) Hitung direct_loss per jenis & skala hanya untuk bangunan ini
+        direct_losses = {}
+        for nama, cfg in mapping.items():
+            raw_table  = cfg["raw"]
+            dmgr_table = cfg["dmgr"]
+            pre        = cfg["prefix"]
+            scales     = cfg["scales"]
+            thr        = cfg["threshold"]
+            vcols_fn   = cfg["vcols"]
+
+            # buat daftar SELECT expressions
+            subq = []
+            for s in scales:
+                subq += vcols_fn(pre, s)
+            subq_cols = ", ".join(subq)
+
+            sql = text(f"""
+                SELECT {subq_cols}
+                FROM bangunan_copy b
+                JOIN LATERAL (
+                  SELECT {subq_cols}
+                  FROM {raw_table} r
+                  JOIN {dmgr_table} h USING(id_lokasi)
+                  WHERE ST_DWithin(b.geom, r.geom, {thr})
+                  ORDER BY b.geom <-> r.geom
+                  LIMIT 1
+                ) AS near ON TRUE
+                WHERE b.id_bangunan = :id
+            """)
+
+            near = conn.execute(sql, {"id": bangunan_id}).mappings().first() or {}
+
+            # ekstrak nilai_vulnerability & hitung direct_loss
+            for s in scales:
+                dlc = f"direct_loss_{nama}_{s}"
+                if nama == "banjir":
+                    y1 = near.get(f"nilai_y_1_{pre}{s}", 0)
+                    y2 = near.get(f"nilai_y_2_{pre}{s}", 0)
+                    v  = y1 if floors_val == 1 else y2
+                else:
+                    ycols = [
+                        f"nilai_y_cr_{pre}{s}",
+                        f"nilai_y_mcf_{pre}{s}",
+                        f"nilai_y_mur_{pre}{s}",
+                        f"nilai_y_lightwood_{pre}{s}"
+                    ]
+                    v = max(near.get(c, 0) for c in ycols)
+                direct_losses[dlc] = float(luas_val * hsbgn_val * v)
+
+    # 4) Simpan DirectLoss & update AAL seperti semula
     old = db.session.query(HasilProsesDirectLoss).filter_by(id_bangunan=bangunan_id).one_or_none()
     old_vals = {c: getattr(old, c) for c in direct_losses} if old else {c: 0 for c in direct_losses}
-
-    # print("old_vals", old_vals)
 
     if old:
         db.session.delete(old)
@@ -274,14 +356,16 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
         delta_aal = float(delta * (-math.log(1 - p)))
         col_tax = f"aal_{dis}_{sc}_{kode_bgn}"
         col_tot = f"aal_{dis}_{sc}_total"
+        # update atribut objek dan juga via UPDATE
         setattr(aal_row, col_tax, float(getattr(aal_row, col_tax, 0)) + delta_aal)
         setattr(aal_row, col_tot, float(getattr(aal_row, col_tot, 0)) + delta_aal)
         db.session.query(HasilAALProvinsi)\
-        .filter_by(provinsi=prov)\
-        .update({
-            col_tax: HasilAALProvinsi.__table__.c[col_tax] + delta_aal,
-            col_tot: HasilAALProvinsi.__table__.c[col_tot] + delta_aal
-        })
+            .filter_by(provinsi=prov)\
+            .update({
+                col_tax: HasilAALProvinsi.__table__.c[col_tax] + delta_aal,
+                col_tot: HasilAALProvinsi.__table__.c[col_tot] + delta_aal
+            })
+
     db.session.commit()
     logger.info(f"✅ AAL incremental updated for provinsi {prov}")
     logger.debug(f"=== END incremental recalc for {bangunan_id} ===")

@@ -27,7 +27,7 @@ from app.route.route_visualisasi_kurva import disaster_curve_bp
 
 
 # coba gempa hazxard
-from app.controller.controller_buffer_hazard import bp as buffer_disaster_bp
+from app.route.route_buffer_hazard import bp as buffer_disaster_bp
 # inside create_app():
 
 

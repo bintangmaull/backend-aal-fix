@@ -1,45 +1,35 @@
-from flask import Blueprint, jsonify, request
 from app.service.service_buffer_hazard import BufferDisasterService
 
-bp = Blueprint("buffer_disaster", __name__, url_prefix="/api/buffer")
 
-@bp.route("/<dtype>", methods=["GET"])
-def get_buffer(dtype):
-    # parse bbox & tol
-    
-    try:
-        bbox = {
-            "minlng": float(request.args["minlng"]),
-            "minlat": float(request.args["minlat"]),
-            "maxlng": float(request.args["maxlng"]),
-            "maxlat": float(request.args["maxlat"])
-        }
-    except (KeyError, ValueError):
-        return jsonify({"error":"Parameter bbox (minlng,minlat,maxlng,maxlat) wajib numeric"}), 400
+class BufferDisasterController:
+    @staticmethod
+    def get_buffer(dtype: str,
+                   bbox: dict,
+                   field: str,
+                   tol: float) -> dict:
+        """
+        Delegates to the BufferDisasterService to compute buffer
+        and returns a GeoJSON-like feature collection.
+        """
+        return BufferDisasterService.get_feature_collection(
+            dtype=dtype,
+            field=field,
+            bbox=bbox,
+            tol=tol
+        )
 
-    try:
-        tol = float(request.args.get("tol", 0.001))
-    except ValueError:
-        tol = 0.001
-
-    field = request.args.get("field")
-    if not field:
-        return jsonify({"error":"Parameter field wajib"}),400
-    fc = BufferDisasterService.get_feature_collection(dtype, field, bbox, tol)
-    return jsonify(fc)
-
-@bp.route("/<dtype>/nearest", methods=["GET"])
-def get_nearest(dtype):
-    field = request.args.get("field")
-    if not field:
-        return jsonify({"error":"Parameter field wajib"}), 400
-    try:
-        lat = float(request.args["lat"])
-        lng = float(request.args["lng"])
-    except (KeyError, ValueError):
-        return jsonify({"error":"lat & lng wajib numeric"}), 400
-
-    data = BufferDisasterService.get_nearest(dtype, field, lat, lng)
-    if not data:
-        return jsonify({"error":"tidak ditemukan"}), 404
-    return jsonify(data)
+    @staticmethod
+    def get_nearest(dtype: str,
+                    field: str,
+                    lat: float,
+                    lng: float) -> dict:
+        """
+        Delegates to the BufferDisasterService to find the nearest feature
+        and returns its properties as a dict (or None if not found).
+        """
+        return BufferDisasterService.get_nearest(
+            dtype=dtype,
+            field=field,
+            lat=lat,
+            lng=lng
+        )
