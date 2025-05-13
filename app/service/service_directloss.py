@@ -193,37 +193,34 @@ def calculate_aal():
 
 
 def recalc_building_directloss_and_aal(bangunan_id: str):
-    """
-    Incremental recalc direct loss + AAL untuk satu bangunan tertentu.
-    """
     logger.debug(f"=== START incremental recalc for {bangunan_id} ===")
 
-    # 1) Ambil data bangunan langsung dari DB
+    # Ambil data bangunan
     engine = get_db_connection()
     with engine.connect() as conn:
         b_query = text("""
             SELECT
-              geom,
-              luas,
-              COALESCE(hsbgn,0) AS hsbgn,
-              COALESCE(jumlah_lantai,0) AS jumlah_lantai,
-              provinsi,
-              LOWER(split_part(id_bangunan, '_', 1)) AS kode_bangunan
-            FROM bangunan_copy
-            WHERE id_bangunan = :id
+              b.geom,
+              b.luas,
+              COALESCE(k.hsbgn, 0) AS hsbgn,
+              COALESCE(b.jumlah_lantai, 0) AS jumlah_lantai,
+              b.provinsi,
+              LOWER(split_part(b.id_bangunan, '_', 1)) AS kode_bangunan
+            FROM bangunan_copy b
+            LEFT JOIN kota k ON b.kota = k.kota
+            WHERE b.id_bangunan = :id
         """)
         b = conn.execute(b_query, {"id": bangunan_id}).mappings().first()
         if not b:
             raise ValueError(f"Bangunan {bangunan_id} tidak ditemukan")
 
-        geom        = b["geom"]
-        luas_val    = b["luas"]
-        hsbgn_val   = b["hsbgn"]
-        floors_val  = int(np.clip(b["jumlah_lantai"], 1, 2))
-        prov        = b["provinsi"]
-        kode_bgn    = b["kode_bangunan"]
+        geom       = b["geom"]
+        luas_val   = b["luas"]
+        hsbgn_val  = b["hsbgn"]
+        floors_val = int(np.clip(b["jumlah_lantai"], 1, 2))
+        prov       = b["provinsi"]
+        kode_bgn   = b["kode_bangunan"]
 
-        # 2) Mapping untuk tiap jenis bencana
         mapping = {
             "gempa": {
                 "raw":      "model_intensitas_gempa",
@@ -287,17 +284,23 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
             thr        = cfg["threshold"]
             vcols_fn   = cfg["vcols"]
 
-            # buat daftar SELECT expressions
-            subq = []
+            # build subquery cols & outer cols
+            subq_parts = []
+            outer_cols = []
             for s in scales:
-                subq += vcols_fn(pre, s)
-            subq_cols = ", ".join(subq)
+                for expr in vcols_fn(pre, s):
+                    subq_parts.append(expr)
+                    alias = expr.split(" AS ")[1]
+                    outer_cols.append(f"near.{alias}")
+
+            subq_sql  = ", ".join(subq_parts)
+            outer_sql = ", ".join(outer_cols)
 
             sql = text(f"""
-                SELECT {subq_cols}
+                SELECT {outer_sql}
                 FROM bangunan_copy b
                 JOIN LATERAL (
-                  SELECT {subq_cols}
+                  SELECT {subq_sql}
                   FROM {raw_table} r
                   JOIN {dmgr_table} h USING(id_lokasi)
                   WHERE ST_DWithin(b.geom, r.geom, {thr})
@@ -309,7 +312,6 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
 
             near = conn.execute(sql, {"id": bangunan_id}).mappings().first() or {}
 
-            # ekstrak nilai_vulnerability & hitung direct_loss
             for s in scales:
                 dlc = f"direct_loss_{nama}_{s}"
                 if nama == "banjir":
@@ -317,13 +319,13 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                     y2 = near.get(f"nilai_y_2_{pre}{s}", 0)
                     v  = y1 if floors_val == 1 else y2
                 else:
-                    ycols = [
-                        f"nilai_y_cr_{pre}{s}",
-                        f"nilai_y_mcf_{pre}{s}",
-                        f"nilai_y_mur_{pre}{s}",
-                        f"nilai_y_lightwood_{pre}{s}"
-                    ]
+                    ycols = [f"nilai_y_cr_{pre}{s}",
+                             f"nilai_y_mcf_{pre}{s}",
+                             f"nilai_y_mur_{pre}{s}",
+                             f"nilai_y_lightwood_{pre}{s}"]
                     v = max(near.get(c, 0) for c in ycols)
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    v = 0.0
                 direct_losses[dlc] = float(luas_val * hsbgn_val * v)
 
     # 4) Simpan DirectLoss & update AAL seperti semula
