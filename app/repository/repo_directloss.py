@@ -65,7 +65,7 @@ def get_all_disaster_data():
             "dmgr":     "dmgratio_gempa",
             "prefix":   "mmi",
             "scales":   ["500","250","100"],
-            "threshold": 9000,
+            "threshold": 9500,
             "vcols":    vcols_gempa
         },
         "banjir": {
@@ -73,7 +73,7 @@ def get_all_disaster_data():
             "dmgr":     "dmgratio_banjir_copy",
             "prefix":   "depth",
             "scales":   ["100","50","25"],
-            "threshold": 750,
+            "threshold": 700,
             "vcols":    vcols_banjir
         },
         "longsor": {
@@ -81,7 +81,7 @@ def get_all_disaster_data():
             "dmgr":     "dmgratio_longsor",
             "prefix":   "mflux",
             "scales":   ["5","2"],
-            "threshold": 750,
+            "threshold": 700,
             "vcols":    vcols_gempa  # sama struktur dengan gempa
         },
         "gunungberapi": {
@@ -89,7 +89,7 @@ def get_all_disaster_data():
             "dmgr":     "dmgratio_gunungberapi",
             "prefix":   "kpa",
             "scales":   ["250","100","50"],
-            "threshold": 750,
+            "threshold": 550,
             "vcols":    vcols_gempa
         }
     }

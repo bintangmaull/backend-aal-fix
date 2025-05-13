@@ -230,7 +230,7 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                 "dmgr":     "dmgratio_gempa",
                 "prefix":   "mmi",
                 "scales":   ["500","250","100"],
-                "threshold": 9000,
+                "threshold": 9500,
                 "vcols":    lambda pre,s: [
                     f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
                     f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
@@ -243,7 +243,7 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                 "dmgr":     "dmgratio_banjir_copy",
                 "prefix":   "depth",
                 "scales":   ["100","50","25"],
-                "threshold": 750,
+                "threshold": 700,
                 "vcols":    lambda pre,s: [
                     f"h.dmgratio_1_{pre}{s} AS nilai_y_1_{pre}{s}",
                     f"h.dmgratio_2_{pre}{s} AS nilai_y_2_{pre}{s}",
@@ -254,7 +254,7 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                 "dmgr":     "dmgratio_longsor",
                 "prefix":   "mflux",
                 "scales":   ["5","2"],
-                "threshold": 750,
+                "threshold": 700,
                 "vcols":    lambda pre,s: [
                     f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
                     f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
@@ -267,7 +267,7 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                 "dmgr":     "dmgratio_gunungberapi",
                 "prefix":   "kpa",
                 "scales":   ["250","100","50"],
-                "threshold": 750,
+                "threshold": 550,
                 "vcols":    lambda pre,s: [
                     f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
                     f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
