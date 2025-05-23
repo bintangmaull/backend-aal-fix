@@ -17,19 +17,17 @@ from app.route.route_directloss import setup_join_routes
 from app.route.route_visualisasi_hazard import register_visualisasi_routes_hazard
 
 # (Optional) preload curves
-from app.repository.repo_kurva_gempa import get_reference_curves as load_gempa
+from app.repository.repo_kurva_gempa import get_reference_curves_gempa as load_gempa
 from app.repository.repo_kurva_gunungberapi import get_reference_curves_gunungberapi as load_gunung
 from app.repository.repo_kurva_longsor import get_reference_curves_longsor as load_longsor
 from app.repository.repo_kurva_banjir import get_reference_curves_banjir as load_banjir
 
-#visualisasi kurva
+# visualisasi kurva
 from app.route.route_visualisasi_kurva import disaster_curve_bp
 
-
-# coba gempa hazxard
+# coba gempa hazard
 from app.route.route_buffer_hazard import bp as buffer_disaster_bp
-# inside create_app():
-
+#from app.route.route_visualisasi_hazard import bencana_bp  # Hapus import ini agar tidak didaftarkan 2x
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -62,8 +60,10 @@ def create_app():
     app.register_blueprint(bangunan_bp)
     app.register_blueprint(hsbgn_bp)
     app.register_blueprint(disaster_curve_bp)
+    # Hapus pendaftaran langsung bencana_bp karena sudah didaftarkan via register_visualisasi_routes_hazard
+    # app.register_blueprint(bencana_bp)
 
-    #test
+    # test
     app.register_blueprint(buffer_disaster_bp)
     logger.info("✅ CRUD & raw-data blueprints registered")
 
@@ -73,7 +73,9 @@ def create_app():
     setup_join_routes(app)
     logger.info("✅ Direct-loss visualization routes registered")
 
+    # Daftarkan blueprint bencana_bp lewat fungsi khusus agar tidak dobel
     register_visualisasi_routes_hazard(app)
+
     # preload curves & check DB connection
     with app.app_context():
         _load_reference_curves()

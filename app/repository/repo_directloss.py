@@ -1,4 +1,4 @@
-# repo_directloss.py
+# app/repository/repo_directloss.py
 
 import os
 import pandas as pd
@@ -40,8 +40,8 @@ def get_bangunan_data():
 def get_all_disaster_data():
     """
     Untuk tiap jenis bencana:
-     - Filter titik intensitas dalam 'threshold'
-     - Cari nearest dengan KNN (<->)
+     - Filter titik intensitas dalam 'threshold' (meter via geography)
+     - Cari nearest dengan KNN (<->) di geography
      - Ambil nilai vulnerability via dmgratio_*
     """
     def vcols_gempa(pre, s):
@@ -53,7 +53,6 @@ def get_all_disaster_data():
         ]
 
     def vcols_banjir(pre, s):
-        # dmgratio_1_depth100, dmgratio_2_depth100
         return [
             f"h.dmgratio_1_{pre}{s} AS nilai_y_1_{pre}{s}",
             f"h.dmgratio_2_{pre}{s} AS nilai_y_2_{pre}{s}",
@@ -82,7 +81,7 @@ def get_all_disaster_data():
             "prefix":   "mflux",
             "scales":   ["5","2"],
             "threshold": 700,
-            "vcols":    vcols_gempa  # sama struktur dengan gempa
+            "vcols":    vcols_gempa
         },
         "gunungberapi": {
             "raw":      "model_intensitas_gunungberapi",
@@ -106,7 +105,6 @@ def get_all_disaster_data():
             threshold  = cfg["threshold"]
             make_vcols = cfg["vcols"]
 
-            # Bangun daftar ekspresi subquery & daftar alias untuk outer SELECT
             subq_parts = []
             sel_parts  = []
             for s in scales:
@@ -129,19 +127,16 @@ def get_all_disaster_data():
                   FROM {raw_table} r
                   JOIN {dmgr_table} h USING(id_lokasi)
                   WHERE ST_DWithin(
-                    b.geom,
-                    r.geom,
+                    b.geom::geography,
+                    r.geom::geography,
                     {threshold}
                   )
-                  ORDER BY b.geom <-> r.geom
+                  ORDER BY b.geom::geography <-> r.geom::geography
                   LIMIT 1
                 ) AS near ON TRUE;
             """
 
-            try:
-                df = pd.read_sql(text(sql), conn)
-                all_data[name] = df
-            except Exception as e:
-                raise RuntimeError(f"❌ Gagal mengambil data '{name}': {e}")
+            df = pd.read_sql(text(sql), conn)
+            all_data[name] = df
 
     return all_data

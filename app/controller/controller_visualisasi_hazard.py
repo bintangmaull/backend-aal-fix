@@ -1,31 +1,66 @@
-from flask import jsonify, current_app, send_file
+from flask import Blueprint, jsonify
+from app.service.service_visualisasi_hazard import RasterService
+from app.geoserver_register import upload_all_geotiffs
+bencana_bp = Blueprint('bencana_bp', __name__)
 
-from app.service.service_visualisasi_hazard import VisualisasiHazardService
+@bencana_bp.route('/generate-raster/<bencana>/<kolom>', methods=['GET'])
+def generate_raster(bencana, kolom):
+    allowed_bencana = ['gempa', 'banjir', 'longsor', 'gunungberapi']
+    if bencana not in allowed_bencana:
+        return jsonify({'status': 'error', 'message': 'Jenis bencana tidak valid'}), 400
 
-def get_reference_curves(hazard_type):
-    try:
-        data = VisualisasiHazardService.get_curves(hazard_type)
-        return jsonify(data), 200
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 404
-    except Exception as e:
-        current_app.logger.error(f"Error fetching curves for {hazard_type}: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+    raster_path, error = RasterService.generate_raster_from_points(bencana, kolom)
+    if error:
+        return jsonify({'status': 'error', 'message': error}), 404
 
-def get_density_raster(hazard_type):
-    try:
-        path = VisualisasiHazardService.generate_density_geotiff(hazard_type)
-        return send_file(path, as_attachment=False)
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 404
-    except Exception as e:
-        current_app.logger.error(f"Error generating raster for {hazard_type}: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+    return jsonify({'status': 'success', 'raster_file': raster_path})
 
-def reload_all_rasters():
-    try:
-        VisualisasiHazardService.generate_all_density_geotiffs()
-        return jsonify({'status': 'all rasters regenerated'}), 200
-    except Exception as e:
-        current_app.logger.error(f"Error reloading rasters: {e}")
-        return jsonify({'error': 'Failed to reload rasters'}), 500
+
+@bencana_bp.route('/generate-all-raster', methods=['GET'])
+def generate_all_raster():
+    bencana_map = {
+        'gempa': ['mmi_100', 'mmi_250', 'mmi_500'],
+        'banjir': ['depth_100', 'depth_50', 'depth_25'],
+        'longsor': ['mflux_5', 'mflux_2'],
+        'gunungberapi': ['kpa_50', 'kpa_100', 'kpa_250']
+    }
+
+    hasil = []
+
+    for bencana, koloms in bencana_map.items():
+        for kolom in koloms:
+            try:
+                path, error = RasterService.generate_raster_from_points(bencana, kolom)
+                if error:
+                    hasil.append({
+                        'bencana': bencana,
+                        'kolom': kolom,
+                        'status': 'error',
+                        'message': error
+                    })
+                else:
+                    hasil.append({
+                        'bencana': bencana,
+                        'kolom': kolom,
+                        'status': 'success',
+                        'raster_file': path
+                    })
+            except Exception as e:
+                hasil.append({
+                    'bencana': bencana,
+                    'kolom': kolom,
+                    'status': 'error',
+                    'message': str(e)
+                })
+
+    return jsonify(hasil)
+
+
+@bencana_bp.route('/geoserver/upload-all', methods=['GET'])
+def upload_all_to_geoserver():
+    """
+    Generate semua raster sebagai GeoTIFF dan upload ke GeoServer
+    via REST PUT external.geotiff
+    """
+    results = upload_all_geotiffs()
+    return jsonify(results)

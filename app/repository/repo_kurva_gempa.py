@@ -1,34 +1,31 @@
+# app/repository/repo_kurva_gempa.py
+
+import logging
 from app.models.models_database import GempaReferenceCurve
 from app.extensions import db
-import logging
 
 logger = logging.getLogger(__name__)
 
-def get_reference_curves():
-    """Mengambil referensi kurva gempa dari database dengan transaksi yang aman."""
+def get_reference_curves_gempa():
+    """Mengambil referensi kurva Gempa dengan safe‐session."""
     try:
-        logger.info("📥 Mengambil referensi kurva gempa dari database...")
-
-        # **Gunakan sesi dengan pengelolaan yang lebih aman**
-        with db.session.no_autoflush:  # Menghindari nested transaction error
+        logger.info("📥 Mengambil referensi kurva Gempa dari database...")
+        with db.session.no_autoflush:
             curves = db.session.query(GempaReferenceCurve).all()
-
-        # **Pastikan session ditutup setelah query**
         db.session.expunge_all()
         db.session.close()
 
         reference_curves = {}
         for curve in curves:
-            if curve.tipe_kurva not in reference_curves:
-                reference_curves[curve.tipe_kurva] = {"x": [], "y": []}
+            reference_curves.setdefault(curve.tipe_kurva, {"x": [], "y": []})
             reference_curves[curve.tipe_kurva]["x"].append(curve.x)
             reference_curves[curve.tipe_kurva]["y"].append(curve.y)
 
-        logger.info(f"✅ Berhasil mengambil {len(curves)} referensi kurva gempa.")
+        logger.info(f"✅ Berhasil mengambil {len(curves)} referensi kurva Gempa.")
         return reference_curves
 
     except Exception as e:
-        db.session.rollback()  # Pastikan transaksi dibatalkan jika error
-        db.session.close()  # Tutup sesi untuk menghindari kebocoran
-        logger.error(f"❌ ERROR: Gagal mengambil referensi kurva gempa dari database: {e}")
-        return {}  # Kembalikan dictionary kosong jika gagal
+        db.session.rollback()
+        db.session.close()
+        logger.error(f"❌ ERROR mengambil kurva Gempa: {e}")
+        return {}

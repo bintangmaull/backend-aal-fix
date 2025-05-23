@@ -1,168 +1,172 @@
 import os
-import logging
-
-import geopandas as gpd
+import tempfile
 import numpy as np
+import geopandas as gpd
 import rasterio
-from shapely.geometry import mapping
+import logging
 from rasterio.transform import from_origin
-from rasterio.features import rasterize, geometry_mask
-from rasterio.fill import fillnodata
+from rasterio.mask import mask
+from rasterio.features import rasterize
+from scipy.spatial import cKDTree
+from scipy.interpolate import griddata
+from app.repository.repo_visualisasi_hazard import IntensitasRepo
+from app import db
 
-from app.extensions import db
-from app.repository.repo_kurva_banjir import get_reference_curves_banjir
-from app.repository.repo_kurva_gempa import get_reference_curves as get_reference_curves_gempa
-from app.repository.repo_kurva_gunungberapi import get_reference_curves_gunungberapi
-from app.repository.repo_kurva_longsor import get_reference_curves_longsor
-
-# Supaya rasterio/pyproj menemukan proj.db yang benar
-os.environ['PROJ_LIB'] = r"E:\Geodesi dan Geomatika\Semester 7\TA\CobaPython\myenv311\Lib\site-packages\rasterio\proj_data"
-
-# --- Logging setup ---
 logger = logging.getLogger(__name__)
-# Pastikan di konfigurasi aplikasi logger level DEBUG diaktifkan:
-# logging.basicConfig(level=logging.DEBUG)
 
-# Folder cache absolut di dalam direktori app/
-BASE_APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-CACHE_DIR    = os.path.join(BASE_APP_DIR, 'cache')
+class RasterService:
+    @staticmethod
+    def generate_raster_from_points(bencana, kolom):
+        logger.info(f"📥 Mulai generate raster untuk {bencana} - {kolom}")
+        points = IntensitasRepo.get_points_by_bencana(bencana, kolom)
+        if not points:
+            logger.warning("⚠️ Tidak ada data titik ditemukan.")
+            return None, "No data found"
 
-class VisualisasiHazardService:
-    _CURVE_MAPPING = {
-        'banjir':       get_reference_curves_banjir,
-        'gempa':        get_reference_curves_gempa,
-        'gunungberapi': get_reference_curves_gunungberapi,
-        'longsor':      get_reference_curves_longsor,
-    }
+        xs = np.array([p['x'] for p in points])
+        ys = np.array([p['y'] for p in points])
+        zs = np.array([p.get(kolom) if p.get(kolom) is not None else 0 for p in points])
+        logger.info(f"✅ Jumlah titik: {len(points)}")
 
-    _RASTER_MAPPING = {
-        'banjir':       ('model_intensitas_banjir', 'depth_100'),
-        'gempa':        ('model_intensitas_gempa', 'mmi_500'),
-        'gunungberapi': ('model_intensitas_gunungberapi', 'kpa_250'),
-        'longsor':      ('model_intensitas_longsor', 'mflux_5'),
-    }
+        pixel_size = 0.01
 
-    @classmethod
-    def generate_density_geotiff(
-        cls,
-        hazard_type: str,
-        pixel_size_km: float = 9.0,
-        sample_size: int = 10000
-    ) -> str:
-        logger.debug("=== Mulai generate_density_geotiff ===")
-        if hazard_type not in cls._RASTER_MAPPING:
-            logger.error(f"Unknown hazard type: {hazard_type}")
-            raise ValueError(f"Unknown hazard type for raster: {hazard_type}")
+        # Ambil bounds seluruh Indonesia dari tabel provinsi
+        clip_gdf = gpd.read_postgis(
+            """
+            SELECT ST_CollectionExtract(ST_UnaryUnion(ST_MakeValid(geom)), 3) AS geom
+            FROM provinsi
+            """,
+            db.engine,
+            geom_col='geom'
+        ).to_crs(epsg=4326)
+        minx, miny, maxx, maxy = clip_gdf.total_bounds
+        logger.info(f"📦 Bounds Indonesia: {minx},{miny} – {maxx},{maxy}")
 
-        table, value_field = cls._RASTER_MAPPING[hazard_type]
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        output_path = os.path.join(CACHE_DIR, f"{hazard_type}_density.tif")
-        logger.debug(f"Output GeoTIFF path: {output_path}")
+        # Hitung ukuran grid berdasarkan bounds provinsi, bukan titik saja
+        width  = int(np.ceil((maxx - minx) / pixel_size))
+        height = int(np.ceil((maxy - miny) / pixel_size))
+        logger.info(f"🧱 Ukuran raster: {width} x {height}")
 
-        # 1. Load data
-        sql = f"SELECT geom{', ' + value_field if value_field else ''} FROM {table}"
-        logger.debug(f"Executing SQL: {sql}")
-        gdf = gpd.read_postgis(
-            sql,
-            db.get_engine(),
-            geom_col="geom",
-            crs="EPSG:4326"
+        # Buat meshgrid dari bounds provinsi
+        xi = np.linspace(minx, maxx, width)
+        yi = np.linspace(maxy, miny, height)  # flipped so origin top-left
+        grid_x, grid_y = np.meshgrid(xi, yi)
+
+        logger.info("⚙️ Mulai interpolasi IDW...")
+        grid_z = RasterService.idw_interpolation(xs, ys, zs, grid_x, grid_y)
+
+
+        logger.info("🔄 Mengisi NaN dengan nearest-neighbor…")
+        nearest = griddata(
+            (xs, ys),
+            zs,
+            (grid_x, grid_y),
+            method='nearest'
         )
-        n_total = len(gdf)
-        logger.debug(f"Total titik dibaca: {n_total}")
+        # hanya timpa yg NaN
+        grid_z = np.where(np.isnan(grid_z), nearest, grid_z)
+        grid_z = np.nan_to_num(grid_z, nan=0.0)
 
-        # 2. Sampling untuk menentukan resolusi
-        if n_total > sample_size:
-            sampled_gdf = gdf.sample(n=sample_size, random_state=42)
-            logger.debug(f"Sampling {sample_size} titik acak untuk hitung pixel_size")
-        else:
-            sampled_gdf = gdf
-            logger.debug("Jumlah titik kecil, tidak dilakukan sampling")
+        # Buat transform full‐Indonesia
+        transform = from_origin(minx, maxy, pixel_size, pixel_size)
 
-        xs = np.unique(sampled_gdf.geometry.x.values)
-        ys = np.unique(sampled_gdf.geometry.y.values)
-        logger.debug(f"Unique X count: {len(xs)}, Unique Y count: {len(ys)}")
-
-        xs.sort(); ys.sort()
-        if len(xs) > 1 and len(ys) > 1:
-            diffs_x = np.diff(xs)
-            diffs_y = np.diff(ys)
-            res_x = np.median(diffs_x)
-            res_y = np.median(diffs_y)
-            pixel_size = float(np.round((res_x + res_y) / 2, 8))
-            logger.debug(f"Computed pixel_size (deg): res_x={res_x}, res_y={res_y}, pixel_size={pixel_size}")
-        else:
-            deg_per_km = 1.0 / 111.32
-            pixel_size = pixel_size_km * deg_per_km
-            logger.debug(f"Fallback pixel_size dari km: {pixel_size} deg (km={pixel_size_km})")
-
-        # 3. Hitung origin agar pusat piksel tepat pada titik
-        half = pixel_size / 2.0
-        minx, maxy = xs[0], ys[-1]
-        origin_x = minx - half
-        origin_y = maxy + half
-        logger.debug(f"Origin: ({origin_x}, {origin_y}), half={half}")
-
-        # 4. Grid dimensi
-        width  = int(np.ceil((xs[-1] - xs[0]) / pixel_size)) + 1
-        height = int(np.ceil((ys[-1] - ys[0]) / pixel_size)) + 1
-        logger.debug(f"Grid size: width={width}, height={height}")
-        transform = from_origin(origin_x, origin_y, pixel_size, pixel_size)
-
-        # 5. Prepare shapes untuk rasterize
-        if value_field:
-            shapes = ((row.geom, getattr(row, value_field)) for row in gdf.itertuples())
-            logger.debug(f"Rasterize dengan field nilai: {value_field}")
-        else:
-            shapes = ((row.geom, 1) for row in gdf.itertuples())
-            logger.debug("Rasterize dengan count=1 per titik")
-
-        # 6. Rasterize
-        logger.debug("Mulai rasterize …")
-        raster = rasterize(
-            shapes,
+        logger.info("🧩 Membuat mask daratan untuk seluruh grid...")
+        shapes = ((geom, 1) for geom in clip_gdf.geometry)
+        mask_arr = rasterize(
+            shapes=shapes,
             out_shape=(height, width),
             transform=transform,
             fill=0,
-            all_touched=True,
-            merge_alg=rasterio.enums.MergeAlg.add,
-            dtype="float32"
+            default_value=1,
+            dtype='uint8'
         )
-        logger.debug("Rasterize selesai")
 
-        # 7. Clip & fill
-        logger.debug("Load batas provinsi untuk clipping")
-        prov = gpd.read_postgis("SELECT geom FROM provinsi", db.get_engine(),
-                                geom_col="geom", crs="EPSG:4326")
-        prov['geom'] = prov['geom'].buffer(0)
-        union_geom = prov.geometry.unary_union
-        logger.debug("Membangun mask luar area provinsi")
-        mask_outside = geometry_mask([mapping(union_geom)], transform=transform,
-                                     invert=False, out_shape=raster.shape)
-        raster[mask_outside] = 0.0
-        logger.debug(f"Masked {mask_outside.sum()} sel di luar provinsi")
+        # Siapkan array akhir: isi grid_z di darat, nodata di laut
+        nodata_value = -9999.0
+        arr = np.full((height, width), nodata_value, dtype='float32')
+        # grid_z mungkin mengandung nan, ganti ke 0 sebelum masking
+        grid_z = np.nan_to_num(grid_z, nan=0.0)
+        # isi nilai interpolasi hanya di daratan (mask_arr==1)
+        arr[mask_arr == 1] = grid_z[mask_arr == 1]
 
-        hole_mask = (raster == 0.0) & (~mask_outside)
-        if hole_mask.any():
-            logger.debug(f"Filling nodata di {hole_mask.sum()} sel")
-            filled = fillnodata(raster, mask=hole_mask,
-                                max_search_distance=9999, smoothing_iterations=0)
-            filled[mask_outside] = 0.0
-            raster = filled
-            logger.debug("Fillnodata selesai")
-        else:
-            logger.debug("Tidak ada hole yang perlu di-fill")
+        temp_dir = tempfile.gettempdir()
+        raw_raster_path = os.path.join(temp_dir, f'{bencana}_{kolom}_raw.tif')
 
-        # 8. Tulis GeoTIFF
-        profile = {
-            "driver":   "GTiff",
-            "height":   height, "width": width, "count": 1,
-            "dtype":    "float32", "crs": "EPSG:4326",
-            "transform": transform, "compress": "lzw", "nodata": 0.0
-        }
-        logger.debug(f"Menulis GeoTIFF dengan profile: {profile}")
-        with rasterio.open(output_path, "w", **profile) as dst:
-            dst.write(raster, 1)
-        logger.info(f"GeoTIFF berhasil ditulis: {output_path}")
-        logger.debug("=== Selesai generate_density_geotiff ===")
-        return output_path
+        logger.info(f"💾 Menyimpan raster mentah ke {raw_raster_path}")
+        with rasterio.open(
+            raw_raster_path,
+            'w',
+            driver='GTiff',
+            height=height,
+            width=width,
+            count=1,
+            dtype='float32',
+            crs='+proj=longlat +datum=WGS84 +no_defs',
+            transform=transform,
+            nodata=nodata_value
+        ) as dst:
+            dst.write(arr, 1)
+
+        # Hapus crop=True agar ukuran raster tetap full‐Indonesia
+        logger.info("✂️ Memotong raster sesuai geometri batas (tanpa crop)...")
+        with rasterio.open(raw_raster_path) as src:
+            out_image, out_transform = mask(
+                src,
+                clip_gdf.geometry,
+                nodata=nodata_value  # crop=False by default
+            )
+            out_meta = src.meta.copy()
+
+        out_meta.update({
+            "height": out_image.shape[1],
+            "width": out_image.shape[2],
+            "transform": out_transform,
+            "nodata": nodata_value
+        })
+
+        final_raster_path = os.path.join(temp_dir, f'{bencana}_{kolom}_clipped.tif')
+        logger.info(f"💾 Menyimpan raster akhir ke {final_raster_path}")
+        with rasterio.open(final_raster_path, "w", **out_meta) as dest:
+            dest.write(out_image)
+
+        logger.info("🗂️ Simpan raster ke PostGIS...")
+        RasterService.save_to_postgis(final_raster_path, bencana, kolom)
+        logger.info("✅ Proses selesai")
+
+        return final_raster_path, None
+
+    @staticmethod
+    def idw_interpolation(x, y, z, xi, yi, power=2):
+        xyz = np.vstack((x, y)).T
+        tree = cKDTree(xyz)
+        flat_grid = np.vstack((xi.flatten(), yi.flatten())).T
+
+        dist, idx = tree.query(flat_grid, k=6)
+        weights = 1 / (dist**power + 1e-8)
+        z_values = np.take(z, idx)
+        weighted = np.sum(weights * z_values, axis=1) / np.sum(weights, axis=1)
+
+        return weighted.reshape(xi.shape)
+
+    @staticmethod
+    def save_to_postgis(tif_path, bencana, kolom):
+        from psycopg2 import connect
+        logger.info(f"📤 Membaca {tif_path} untuk disimpan ke PostGIS...")
+        conn = db.engine.raw_connection()
+        cur = conn.cursor()
+        with open(tif_path, 'rb') as f:
+            rast_data = f.read()
+        query = """
+        INSERT INTO hazard_raster (bencana, kolom, rast)
+        VALUES (%s, %s, ST_FromGDALRaster(%s));
+        """
+        try:
+            cur.execute(query, (bencana, kolom, rast_data))
+            conn.commit()
+            logger.info("✅ Raster berhasil disimpan ke tabel hazard_raster")
+        except Exception as e:
+            logger.error(f"❌ Gagal menyimpan raster ke PostGIS: {e}")
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()

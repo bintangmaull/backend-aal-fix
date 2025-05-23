@@ -57,8 +57,16 @@ def process_all_disasters():
     bld['luas'] = bld['luas'].fillna(0)
     bld['hsbgn'] = bld['hsbgn'].fillna(0)
 
-    luas  = bld['luas'].to_numpy()
-    hsbgn = bld['hsbgn'].to_numpy()
+    coeff_map = {
+        1: 1.000, 2: 1.090, 3: 1.120, 4: 1.135,
+        5: 1.162, 6: 1.197, 7: 1.236, 8: 1.265,
+    }
+    floors_clipped = bld['jumlah_lantai'].clip(1, 8).astype(int)
+    bld['hsbgn_coeff']     = floors_clipped.map(coeff_map).fillna(1.0)
+    bld['adjusted_hsbgn']  = bld['hsbgn'] * bld['hsbgn_coeff']
+
+    luas    = bld['luas'].to_numpy()
+    hsbgn   = bld['adjusted_hsbgn'].to_numpy()
 
     # 2) Hazard data (reindexed to bld.index!)
     disaster_data = get_all_disaster_data()
@@ -216,8 +224,31 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
 
         geom       = b["geom"]
         luas_val   = b["luas"]
-        hsbgn_val  = b["hsbgn"]
-        floors_val = int(np.clip(b["jumlah_lantai"], 1, 2))
+        # ambil nilai asli
+        hsbgn_val_raw = b["hsbgn"]
+        raw_floors    = int(b["jumlah_lantai"])
+
+        # lantai banjir 
+        floor_banjir   = int(np.clip(raw_floors, 1, 2))
+        # clip lantai antara 1–8
+        floor_hsbgn    = int(np.clip(raw_floors, 1, 8))
+
+        # peta koefisien HSBGN per lantai
+        coeff_map = {
+            1: 1.000,
+            2: 1.090,
+            3: 1.120,
+            4: 1.135,
+            5: 1.162,
+            6: 1.197,
+            7: 1.236,
+            8: 1.265,
+        }
+
+        # hitung adjusted hsbgn
+        hsbgn_val = hsbgn_val_raw * coeff_map.get(floor_hsbgn, 1.0)
+
+        
         prov       = b["provinsi"]
         kode_bgn   = b["kode_bangunan"]
 
@@ -303,8 +334,8 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                   SELECT {subq_sql}
                   FROM {raw_table} r
                   JOIN {dmgr_table} h USING(id_lokasi)
-                  WHERE ST_DWithin(b.geom, r.geom, {thr})
-                  ORDER BY b.geom <-> r.geom
+                  WHERE ST_DWithin(b.geom::geography, r.geom::geography, {thr})
+                  ORDER BY b.geom::geography <-> r.geom::geography
                   LIMIT 1
                 ) AS near ON TRUE
                 WHERE b.id_bangunan = :id
@@ -317,7 +348,7 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                 if nama == "banjir":
                     y1 = near.get(f"nilai_y_1_{pre}{s}", 0)
                     y2 = near.get(f"nilai_y_2_{pre}{s}", 0)
-                    v  = y1 if floors_val == 1 else y2
+                    v  = y1 if floor_banjir == 1 else y2
                 else:
                     ycols = [f"nilai_y_cr_{pre}{s}",
                              f"nilai_y_mcf_{pre}{s}",
