@@ -72,7 +72,12 @@ def process_all_disasters():
     disaster_data = get_all_disaster_data()
     for name, df in disaster_data.items():
         # fill na, then reindex so length==len(bld)
-        df = df.fillna(0).reindex(bld.index).fillna(0)
+        df = (
+            df
+            .set_index('id_bangunan')                  # pakai id_bangunan sebagai index
+            .reindex(bld['id_bangunan'], fill_value=0) # selaraskan berdasarkan id_bangunan
+            .reset_index(drop=True)                    # kembalikan index default agar 1-1 dengan bld
+        )
         disaster_data[name] = df
         logger.debug(f"📥 {name}: {len(df)} rows (aligned to {len(bld)})")
 
