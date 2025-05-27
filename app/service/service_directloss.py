@@ -46,6 +46,8 @@ def process_all_disasters():
     # 1) Building data (with integer jumlah_lantai)
     bld = get_bangunan_data()
     logger.debug(f"📥 Buildings: {len(bld)} rows")
+
+    # Pastikan kolom kode_bangunan dan taxonomy ada
     if 'kode_bangunan' not in bld.columns or bld['kode_bangunan'].isna().all():
         bld['kode_bangunan'] = (
             bld['id_bangunan'].astype(str)
@@ -53,6 +55,11 @@ def process_all_disasters():
                .str.lower()
         )
         logger.debug("🔧 Derived kode_bangunan from id_bangunan")
+
+    if 'taxonomy' not in bld.columns:
+        logger.error("❌ Kolom 'taxonomy' tidak ditemukan di data bangunan")
+        raise KeyError("Kolom 'taxonomy' tidak ditemukan di data bangunan")
+
     bld['jumlah_lantai'] = bld['jumlah_lantai'].fillna(0).astype(int)
     bld['luas'] = bld['luas'].fillna(0)
     bld['hsbgn'] = bld['hsbgn'].fillna(0)
@@ -62,38 +69,57 @@ def process_all_disasters():
         5: 1.162, 6: 1.197, 7: 1.236, 8: 1.265,
     }
     floors_clipped = bld['jumlah_lantai'].clip(1, 8).astype(int)
-    bld['hsbgn_coeff']     = floors_clipped.map(coeff_map).fillna(1.0)
-    bld['adjusted_hsbgn']  = bld['hsbgn'] * bld['hsbgn_coeff']
+    bld['hsbgn_coeff'] = floors_clipped.map(coeff_map).fillna(1.0)
+    bld['adjusted_hsbgn'] = bld['hsbgn'] * bld['hsbgn_coeff']
 
-    luas    = bld['luas'].to_numpy()
-    hsbgn   = bld['adjusted_hsbgn'].to_numpy()
+    luas = bld['luas'].to_numpy()
+    hsbgn = bld['adjusted_hsbgn'].to_numpy()
 
     # 2) Hazard data (reindexed to bld.index!)
     disaster_data = get_all_disaster_data()
     for name, df in disaster_data.items():
-        # fill na, then reindex so length==len(bld)
         df = (
             df
-            .set_index('id_bangunan')                  # pakai id_bangunan sebagai index
-            .reindex(bld['id_bangunan'], fill_value=0) # selaraskan berdasarkan id_bangunan
-            .reset_index(drop=True)                    # kembalikan index default agar 1-1 dengan bld
+            .set_index('id_bangunan')
+            .reindex(bld['id_bangunan'], fill_value=0)
+            .reset_index(drop=True)
         )
         disaster_data[name] = df
         logger.debug(f"📥 {name}: {len(df)} rows (aligned to {len(bld)})")
 
-    # 3) Direct loss calc
-    prefix_map = {"gempa":"mmi","banjir":"depth","longsor":"mflux","gunungberapi":"kpa"}
+    prefix_map = {"gempa": "mmi", "banjir": "depth", "longsor": "mflux", "gunungberapi": "kpa"}
     scales_map = {
-      "gempa": ["500","250","100"],
-      "banjir": ["100","50","25"],
-      "longsor": ["5","2"],
-      "gunungberapi": ["250","100","50"]
+        "gempa": ["500", "250", "100"],
+        "banjir": ["100", "50", "25"],
+        "longsor": ["5", "2"],
+        "gunungberapi": ["250", "100", "50"]
     }
 
+    # Fungsi helper untuk ambil nilai berdasarkan taxonomy
+    def get_dmgr_value(row, pre, s, taxonomy):
+        if taxonomy == 'mur':
+            return row.get(f'nilai_y_mur_{pre}{s}', 0)
+        elif taxonomy == 'mcf':
+            return row.get(f'nilai_y_mcf_{pre}{s}', 0)
+        elif taxonomy == 'cr':
+            return row.get(f'nilai_y_cr_{pre}{s}', 0)
+        elif taxonomy == 'lightwood':
+            return row.get(f'nilai_y_lightwood_{pre}{s}', 0)
+        else:
+            # Default jika taxonomy tidak dikenal: ambil max semua
+            candidates = [
+                row.get(f'nilai_y_mur_{pre}{s}', 0),
+                row.get(f'nilai_y_mcf_{pre}{s}', 0),
+                row.get(f'nilai_y_cr_{pre}{s}', 0),
+                row.get(f'nilai_y_lightwood_{pre}{s}', 0)
+            ]
+            return max(candidates)
+
     for name, df_raw in disaster_data.items():
-        pre    = prefix_map[name]
+        pre = prefix_map[name]
         scales = scales_map[name]
-        if name == "banjir":
+
+        if name == 'banjir':
             floors = np.clip(bld['jumlah_lantai'].to_numpy(), 1, 2)
             for s in scales:
                 y1 = df_raw[f"nilai_y_1_{pre}{s}"].to_numpy()
@@ -103,24 +129,23 @@ def process_all_disasters():
                 bld[col] = luas * hsbgn * v
                 bld[col] = bld[col].fillna(0)
                 logger.debug(f"{col} sample: {bld[col].head(3).tolist()}")
+
         else:
+            # Untuk hazard lain, hitung per baris sesuai taxonomy
             for s in scales:
-                ycols = [
-                    f"nilai_y_cr_{pre}{s}",
-                    f"nilai_y_mcf_{pre}{s}",
-                    f"nilai_y_mur_{pre}{s}",
-                    f"nilai_y_lightwood_{pre}{s}"
-                ]
-                maxv = df_raw[ycols].to_numpy().max(axis=1)
+                vals = []
+                for i, row in df_raw.iterrows():
+                    taxonomy = bld.at[i, 'taxonomy'] if i in bld.index else None
+                    val = get_dmgr_value(row, pre, s, taxonomy)
+                    vals.append(val)
                 col = f"direct_loss_{name}_{s}"
-                bld[col] = luas * hsbgn * maxv
+                bld[col] = luas * hsbgn * np.array(vals)
                 bld[col] = bld[col].fillna(0)
                 logger.debug(f"{col} sample: {bld[col].head(3).tolist()}")
 
     # 4) Save Direct Loss
     dl_cols = [c for c in bld.columns if c.startswith("direct_loss_")]
-
-    bld = bld.drop_duplicates(subset='id_bangunan', keep='last')    
+    bld = bld.drop_duplicates(subset='id_bangunan', keep='last')
 
     mappings = [
         {"id_bangunan": row['id_bangunan'], **{c: row[c] for c in dl_cols}}
@@ -144,6 +169,7 @@ def process_all_disasters():
     calculate_aal()
     logger.debug("=== END process_all_disasters ===")
     return csv_path
+
 
 def calculate_aal():
     path = os.path.join(DEBUG_DIR, "directloss_all.csv")
@@ -208,7 +234,7 @@ def calculate_aal():
 def recalc_building_directloss_and_aal(bangunan_id: str):
     logger.debug(f"=== START incremental recalc for {bangunan_id} ===")
 
-    # Ambil data bangunan
+    # Ambil data bangunan dan taxonomy
     engine = get_db_connection()
     with engine.connect() as conn:
         b_query = text("""
@@ -218,7 +244,8 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
               COALESCE(k.hsbgn, 0) AS hsbgn,
               COALESCE(b.jumlah_lantai, 0) AS jumlah_lantai,
               b.provinsi,
-              LOWER(split_part(b.id_bangunan, '_', 1)) AS kode_bangunan
+              LOWER(split_part(b.id_bangunan, '_', 1)) AS kode_bangunan,
+              LOWER(b.taxonomy) AS taxonomy
             FROM bangunan_copy b
             LEFT JOIN kota k ON b.kota = k.kota
             WHERE b.id_bangunan = :id
@@ -227,100 +254,107 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
         if not b:
             raise ValueError(f"Bangunan {bangunan_id} tidak ditemukan")
 
-        geom       = b["geom"]
-        luas_val   = b["luas"]
-        # ambil nilai asli
+        geom = b["geom"]
+        luas_val = b["luas"]
         hsbgn_val_raw = b["hsbgn"]
-        raw_floors    = int(b["jumlah_lantai"])
+        raw_floors = int(b["jumlah_lantai"])
+        taxonomy = b["taxonomy"]
 
-        # lantai banjir 
-        floor_banjir   = int(np.clip(raw_floors, 1, 2))
-        # clip lantai antara 1–8
-        floor_hsbgn    = int(np.clip(raw_floors, 1, 8))
+        floor_banjir = int(np.clip(raw_floors, 1, 2))
+        floor_hsbgn = int(np.clip(raw_floors, 1, 8))
 
-        # peta koefisien HSBGN per lantai
         coeff_map = {
-            1: 1.000,
-            2: 1.090,
-            3: 1.120,
-            4: 1.135,
-            5: 1.162,
-            6: 1.197,
-            7: 1.236,
-            8: 1.265,
+            1: 1.000, 2: 1.090, 3: 1.120, 4: 1.135,
+            5: 1.162, 6: 1.197, 7: 1.236, 8: 1.265,
         }
 
-        # hitung adjusted hsbgn
         hsbgn_val = hsbgn_val_raw * coeff_map.get(floor_hsbgn, 1.0)
 
-        
-        prov       = b["provinsi"]
-        kode_bgn   = b["kode_bangunan"]
+        prov = b["provinsi"]
+        kode_bgn = b["kode_bangunan"]
 
         mapping = {
             "gempa": {
-                "raw":      "model_intensitas_gempa",
-                "dmgr":     "dmgratio_gempa",
-                "prefix":   "mmi",
-                "scales":   ["500","250","100"],
+                "raw": "model_intensitas_gempa",
+                "dmgr": "dmgratio_gempa",
+                "prefix": "mmi",
+                "scales": ["500", "250", "100"],
                 "threshold": 9500,
-                "vcols":    lambda pre,s: [
-                    f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
-                    f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
-                    f"h.dmgratio_mur_{pre}{s}        AS nilai_y_mur_{pre}{s}",
-                    f"h.dmgratio_lightwood_{pre}{s}  AS nilai_y_lightwood_{pre}{s}",
+                "vcols": lambda pre, s: [
+                    f"h.dmgratio_cr_{pre}{s} AS nilai_y_cr_{pre}{s}",
+                    f"h.dmgratio_mcf_{pre}{s} AS nilai_y_mcf_{pre}{s}",
+                    f"h.dmgratio_mur_{pre}{s} AS nilai_y_mur_{pre}{s}",
+                    f"h.dmgratio_lightwood_{pre}{s} AS nilai_y_lightwood_{pre}{s}",
                 ]
             },
             "banjir": {
-                "raw":      "model_intensitas_banjir",
-                "dmgr":     "dmgratio_banjir_copy",
-                "prefix":   "depth",
-                "scales":   ["100","50","25"],
+                "raw": "model_intensitas_banjir",
+                "dmgr": "dmgratio_banjir_copy",
+                "prefix": "depth",
+                "scales": ["100", "50", "25"],
                 "threshold": 700,
-                "vcols":    lambda pre,s: [
+                "vcols": lambda pre, s: [
                     f"h.dmgratio_1_{pre}{s} AS nilai_y_1_{pre}{s}",
                     f"h.dmgratio_2_{pre}{s} AS nilai_y_2_{pre}{s}",
                 ]
             },
             "longsor": {
-                "raw":      "model_intensitas_longsor",
-                "dmgr":     "dmgratio_longsor",
-                "prefix":   "mflux",
-                "scales":   ["5","2"],
+                "raw": "model_intensitas_longsor",
+                "dmgr": "dmgratio_longsor",
+                "prefix": "mflux",
+                "scales": ["5", "2"],
                 "threshold": 700,
-                "vcols":    lambda pre,s: [
-                    f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
-                    f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
-                    f"h.dmgratio_mur_{pre}{s}        AS nilai_y_mur_{pre}{s}",
-                    f"h.dmgratio_lightwood_{pre}{s}  AS nilai_y_lightwood_{pre}{s}",
+                "vcols": lambda pre, s: [
+                    f"h.dmgratio_cr_{pre}{s} AS nilai_y_cr_{pre}{s}",
+                    f"h.dmgratio_mcf_{pre}{s} AS nilai_y_mcf_{pre}{s}",
+                    f"h.dmgratio_mur_{pre}{s} AS nilai_y_mur_{pre}{s}",
+                    f"h.dmgratio_lightwood_{pre}{s} AS nilai_y_lightwood_{pre}{s}",
                 ]
             },
             "gunungberapi": {
-                "raw":      "model_intensitas_gunungberapi",
-                "dmgr":     "dmgratio_gunungberapi",
-                "prefix":   "kpa",
-                "scales":   ["250","100","50"],
+                "raw": "model_intensitas_gunungberapi",
+                "dmgr": "dmgratio_gunungberapi",
+                "prefix": "kpa",
+                "scales": ["250", "100", "50"],
                 "threshold": 550,
-                "vcols":    lambda pre,s: [
-                    f"h.dmgratio_cr_{pre}{s}         AS nilai_y_cr_{pre}{s}",
-                    f"h.dmgratio_mcf_{pre}{s}        AS nilai_y_mcf_{pre}{s}",
-                    f"h.dmgratio_mur_{pre}{s}        AS nilai_y_mur_{pre}{s}",
-                    f"h.dmgratio_lightwood_{pre}{s}  AS nilai_y_lightwood_{pre}{s}",
+                "vcols": lambda pre, s: [
+                    f"h.dmgratio_cr_{pre}{s} AS nilai_y_cr_{pre}{s}",
+                    f"h.dmgratio_mcf_{pre}{s} AS nilai_y_mcf_{pre}{s}",
+                    f"h.dmgratio_mur_{pre}{s} AS nilai_y_mur_{pre}{s}",
+                    f"h.dmgratio_lightwood_{pre}{s} AS nilai_y_lightwood_{pre}{s}",
                 ]
             }
         }
 
-        # 3) Hitung direct_loss per jenis & skala hanya untuk bangunan ini
-        direct_losses = {}
-        for nama, cfg in mapping.items():
-            raw_table  = cfg["raw"]
-            dmgr_table = cfg["dmgr"]
-            pre        = cfg["prefix"]
-            scales     = cfg["scales"]
-            thr        = cfg["threshold"]
-            vcols_fn   = cfg["vcols"]
+        def get_value_from_taxonomy(near, pre, s, taxonomy):
+            if taxonomy == "mur":
+                return near.get(f"nilai_y_mur_{pre}{s}", 0)
+            elif taxonomy == "mcf":
+                return near.get(f"nilai_y_mcf_{pre}{s}", 0)
+            elif taxonomy == "cr":
+                return near.get(f"nilai_y_cr_{pre}{s}", 0)
+            elif taxonomy == "lightwood":
+                return near.get(f"nilai_y_lightwood_{pre}{s}", 0)
+            else:
+                # Default ambil max
+                vals = [
+                    near.get(f"nilai_y_mur_{pre}{s}", 0),
+                    near.get(f"nilai_y_mcf_{pre}{s}", 0),
+                    near.get(f"nilai_y_cr_{pre}{s}", 0),
+                    near.get(f"nilai_y_lightwood_{pre}{s}", 0),
+                ]
+                return max(vals)
 
-            # build subquery cols & outer cols
+        direct_losses = {}
+
+        for nama, cfg in mapping.items():
+            raw_table = cfg["raw"]
+            dmgr_table = cfg["dmgr"]
+            pre = cfg["prefix"]
+            scales = cfg["scales"]
+            thr = cfg["threshold"]
+            vcols_fn = cfg["vcols"]
+
             subq_parts = []
             outer_cols = []
             for s in scales:
@@ -329,19 +363,19 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                     alias = expr.split(" AS ")[1]
                     outer_cols.append(f"near.{alias}")
 
-            subq_sql  = ", ".join(subq_parts)
+            subq_sql = ", ".join(subq_parts)
             outer_sql = ", ".join(outer_cols)
 
             sql = text(f"""
                 SELECT {outer_sql}
                 FROM bangunan_copy b
                 JOIN LATERAL (
-                  SELECT {subq_sql}
-                  FROM {raw_table} r
-                  JOIN {dmgr_table} h USING(id_lokasi)
-                  WHERE ST_DWithin(b.geom::geography, r.geom::geography, {thr})
-                  ORDER BY b.geom::geography <-> r.geom::geography
-                  LIMIT 1
+                    SELECT {subq_sql}
+                    FROM {raw_table} r
+                    JOIN {dmgr_table} h USING(id_lokasi)
+                    WHERE ST_DWithin(b.geom::geography, r.geom::geography, {thr})
+                    ORDER BY b.geom::geography <-> r.geom::geography
+                    LIMIT 1
                 ) AS near ON TRUE
                 WHERE b.id_bangunan = :id
             """)
@@ -353,18 +387,14 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
                 if nama == "banjir":
                     y1 = near.get(f"nilai_y_1_{pre}{s}", 0)
                     y2 = near.get(f"nilai_y_2_{pre}{s}", 0)
-                    v  = y1 if floor_banjir == 1 else y2
+                    v = y1 if floor_banjir == 1 else y2
                 else:
-                    ycols = [f"nilai_y_cr_{pre}{s}",
-                             f"nilai_y_mcf_{pre}{s}",
-                             f"nilai_y_mur_{pre}{s}",
-                             f"nilai_y_lightwood_{pre}{s}"]
-                    v = max(near.get(c, 0) for c in ycols)
+                    v = get_value_from_taxonomy(near, pre, s, taxonomy)
                 if v is None or (isinstance(v, float) and math.isnan(v)):
                     v = 0.0
                 direct_losses[dlc] = float(luas_val * hsbgn_val * v)
 
-    # 4) Simpan DirectLoss & update AAL seperti semula
+    # Simpan DirectLoss dan update AAL
     old = db.session.query(HasilProsesDirectLoss).filter_by(id_bangunan=bangunan_id).one_or_none()
     old_vals = {c: getattr(old, c) for c in direct_losses} if old else {c: 0 for c in direct_losses}
 
@@ -377,10 +407,10 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
     logger.debug(f"✅ DirectLoss updated for {bangunan_id}")
 
     periods = {
-      "gempa_500":0.02, "gempa_250":0.04, "gempa_100":0.10,
-      "banjir_100":0.05,"banjir_50":0.10,"banjir_25":0.20,
-      "gunungberapi_250":0.01,"gunungberapi_100":0.03,"gunungberapi_50":0.05,
-      "longsor_5":0.02,"longsor_2":0.04
+        "gempa_500": 0.02, "gempa_250": 0.04, "gempa_100": 0.10,
+        "banjir_100": 0.05, "banjir_50": 0.10, "banjir_25": 0.20,
+        "gunungberapi_250": 0.01, "gunungberapi_100": 0.03, "gunungberapi_50": 0.05,
+        "longsor_5": 0.02, "longsor_2": 0.04
     }
 
     aal_row = db.session.query(HasilAALProvinsi).filter_by(provinsi=prov).one_or_none()
@@ -394,7 +424,6 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
         delta_aal = float(delta * (-math.log(1 - p)))
         col_tax = f"aal_{dis}_{sc}_{kode_bgn}"
         col_tot = f"aal_{dis}_{sc}_total"
-        # update atribut objek dan juga via UPDATE
         setattr(aal_row, col_tax, float(getattr(aal_row, col_tax, 0)) + delta_aal)
         setattr(aal_row, col_tot, float(getattr(aal_row, col_tot, 0)) + delta_aal)
         db.session.query(HasilAALProvinsi)\
@@ -410,13 +439,10 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
 
     return {"direct_losses": direct_losses}
 
+
 class DisasterService:
     @staticmethod
     def process_city_disasters(kota: str) -> str:
-        """
-        Hitung DirectLoss & AAL untuk semua bangunan di `kota` secara batch (vectorized).
-        Kembalikan path CSV hasilnya.
-        """
         logger.info(f"🔄 Starting disaster processing for kota: {kota}")
 
         # 1) Load & filter bangunan
@@ -428,24 +454,27 @@ class DisasterService:
 
         logger.info(f"📥 Loaded {len(bld)} buildings for kota {kota}")
 
-        # 2) Persiapan columns
+        # 2) Persiapan kolom
         bld["jumlah_lantai"] = bld["jumlah_lantai"].fillna(0).astype(int)
-        bld["luas"]          = bld["luas"].fillna(0)
-        bld["hsbgn"]         = bld["hsbgn"].fillna(0)
+        bld["luas"] = bld["luas"].fillna(0)
+        bld["hsbgn"] = bld["hsbgn"].fillna(0)
+        bld["taxonomy"] = bld["taxonomy"].fillna("mur")  # default taxonomy jika kosong
+
         coeff_map = {1:1.000,2:1.090,3:1.120,4:1.135,
-                     5:1.162,6:1.197,7:1.236,8:1.265}
+                    5:1.162,6:1.197,7:1.236,8:1.265}
         floors = bld["jumlah_lantai"].clip(1,8)
         bld["adjusted_hsbgn"] = bld["hsbgn"] * floors.map(coeff_map).fillna(1.0)
 
-        luas_arr  = bld["luas"].to_numpy()
+        luas_arr = bld["luas"].to_numpy()
         hsbgn_arr = bld["adjusted_hsbgn"].to_numpy()
+        taxonomy_arr = bld["taxonomy"].to_numpy()
 
-        logger.debug("🔧 Prepared adjusted HSBGN and luas arrays")
+        logger.debug("🔧 Prepared adjusted HSBGN, luas arrays, and taxonomy array")
 
         # 3) Load semua disaster_data
         disaster_data = get_all_disaster_data()
         prefix_map = {"gempa":"mmi","banjir":"depth",
-                      "longsor":"mflux","gunungberapi":"kpa"}
+                    "longsor":"mflux","gunungberapi":"kpa"}
         scales_map = {
             "gempa":["500","250","100"],
             "banjir":["100","50","25"],
@@ -454,55 +483,60 @@ class DisasterService:
         }
 
         # 4) Hitung direct_loss vectorized
-        for name, df_raw in disaster_data.items():
-            logger.info(f"⚙️ Processing hazard: {name}")
-            pre    = prefix_map[name]
-            scales = scales_map[name]
+        for hazard, df_raw in disaster_data.items():
+            pre = prefix_map[hazard]
+            scales = scales_map[hazard]
+
             df = (
                 df_raw
                 .set_index("id_bangunan")
                 .reindex(bld["id_bangunan"], fill_value=0)
                 .reset_index(drop=True)
             )
-            if name == "banjir":
-                floors_b = bld["jumlah_lantai"].clip(1,2).to_numpy()
+
+            if hazard == "banjir":
+                floors_b = bld["jumlah_lantai"].clip(1, 2).to_numpy()
                 for s in scales:
                     y1 = df[f"nilai_y_1_{pre}{s}"].to_numpy()
                     y2 = df[f"nilai_y_2_{pre}{s}"].to_numpy()
-                    v  = np.where(floors_b==1, y1, y2)
-                    bld[f"direct_loss_{name}_{s}"] = luas_arr * hsbgn_arr * v
-                    logger.debug(f"Calculated direct_loss_{name}_{s} for kota {kota}")
+                    v = np.where(floors_b == 1, y1, y2)
+                    bld[f"direct_loss_{hazard}_{s}"] = luas_arr * hsbgn_arr * v
+                    logger.debug(f"Calculated direct_loss_{hazard}_{s} for kota {kota}")
+
             else:
                 for s in scales:
-                    ycols = [
-                        f"nilai_y_cr_{pre}{s}",
-                        f"nilai_y_mcf_{pre}{s}",
-                        f"nilai_y_mur_{pre}{s}",
-                        f"nilai_y_lightwood_{pre}{s}"
-                    ]
-                    maxv = df[ycols].to_numpy().max(axis=1)
-                    bld[f"direct_loss_{name}_{s}"] = luas_arr * hsbgn_arr * maxv
-                    logger.debug(f"Calculated direct_loss_{name}_{s} for kota {kota}")
+                    dmgr_values = np.zeros(len(bld))
+                    for tax_type in ["cr", "mcf", "mur", "lightwood"]:
+                        idxs = np.where(taxonomy_arr == tax_type)[0]
+                        if len(idxs) == 0:
+                            continue
+                        vals = df[f"nilai_y_{tax_type}_{pre}{s}"].to_numpy()
+                        # Pastikan indexing valid dan sesuai
+                        dmgr_values[idxs] = vals[idxs]
+                    bld[f"direct_loss_{hazard}_{s}"] = luas_arr * hsbgn_arr * dmgr_values
+                    logger.debug(f"Calculated direct_loss_{hazard}_{s} for kota {kota}")
 
-        # 5) Bulk insert DirectLoss
+        # 5) Bulk insert/update DirectLoss
         dl_cols = [c for c in bld.columns if c.startswith("direct_loss_")]
-        mappings = [
-            {"id_bangunan": row["id_bangunan"], **{c: float(row[c]) for c in dl_cols}}
-            for _, row in bld.iterrows()
-        ]
-        ids = bld["id_bangunan"].tolist()
-        logger.info(f"Deleting old DirectLoss for {len(ids)} bangunan")
-        db.session.query(HasilProsesDirectLoss) \
-            .filter(HasilProsesDirectLoss.id_bangunan.in_(ids)) \
-            .delete(synchronize_session=False)
-        logger.info(f"Inserting new DirectLoss records for kota {kota}")
-        db.session.bulk_insert_mappings(HasilProsesDirectLoss, mappings)
+        mappings = []
+        for _, row in bld.iterrows():
+            existing = db.session.query(HasilProsesDirectLoss).filter_by(id_bangunan=row["id_bangunan"]).one_or_none()
+            if existing:
+                for c in dl_cols:
+                    setattr(existing, c, float(row[c]))
+                mappings.append(existing)
+            else:
+                new_rec = HasilProsesDirectLoss(id_bangunan=row["id_bangunan"], **{c: float(row[c]) for c in dl_cols})
+                mappings.append(new_rec)
+
+        db.session.bulk_save_objects(mappings)
         db.session.commit()
+        logger.info("✅ Direct Loss updated")
 
         # 6) Hitung AAL per provinsi
         prov = bld["provinsi"].iat[0]
         bld["kode_bangunan"] = bld["id_bangunan"].str.split("_").str[0].str.lower()
-        grp = bld.groupby(["provinsi","kode_bangunan"])[dl_cols].sum().reset_index()
+        grp = bld.groupby(["provinsi", "kode_bangunan"])[dl_cols].sum().reset_index()
         periods = {
             "gempa_500":0.02,"gempa_250":0.04,"gempa_100":0.10,
             "banjir_100":0.05,"banjir_50":0.10,"banjir_25":0.20,
@@ -523,10 +557,18 @@ class DisasterService:
             aal[f"{pref}total"] = aal[cols].sum(axis=1)
         aal.fillna(0, inplace=True)
 
-        logger.info(f"Updating AALProvinsi table for provinsi {prov}")
-        db.session.query(HasilAALProvinsi).filter_by(provinsi=prov).delete(synchronize_session=False)
-        db.session.bulk_insert_mappings(HasilAALProvinsi, aal.to_dict("records"))
+        # Update AALProvinsi (update, bukan delete + insert)
+        for _, row in aal.iterrows():
+            existing = db.session.query(HasilAALProvinsi).filter_by(provinsi=row["provinsi"]).one_or_none()
+            if existing:
+                for col in aal.columns:
+                    if col != "provinsi":
+                        setattr(existing, col, row[col])
+            else:
+                new_rec = HasilAALProvinsi(**row.to_dict())
+                db.session.add(new_rec)
         db.session.commit()
+        logger.info("✅ AALProvinsi updated")
 
         # 7) Write CSV
         out = os.path.join(DEBUG_DIR, f"batch_directloss_{kota}.csv")

@@ -29,7 +29,8 @@ def get_bangunan_data():
             b.provinsi,
             b.kota,
             b.jumlah_lantai,
-            COALESCE(k.hsbgn, 0.0) AS hsbgn
+            COALESCE(k.hsbgn, 0.0) AS hsbgn,
+            b.taxonomy    -- <<-- tambahkan ini
         FROM bangunan_copy b
         LEFT JOIN kota k ON b.kota = k.kota;
     """)
