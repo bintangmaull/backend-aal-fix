@@ -409,3 +409,128 @@ def recalc_building_directloss_and_aal(bangunan_id: str):
     logger.debug(f"=== END incremental recalc for {bangunan_id} ===")
 
     return {"direct_losses": direct_losses}
+
+class DisasterService:
+    @staticmethod
+    def process_city_disasters(kota: str) -> str:
+        """
+        Hitung DirectLoss & AAL untuk semua bangunan di `kota` secara batch (vectorized).
+        Kembalikan path CSV hasilnya.
+        """
+        logger.info(f"🔄 Starting disaster processing for kota: {kota}")
+
+        # 1) Load & filter bangunan
+        bld = get_bangunan_data()
+        bld = bld[bld["kota"] == kota].copy()
+        if bld.empty:
+            logger.error(f"❌ Tidak ada bangunan di kota {kota}")
+            raise RuntimeError(f"Tidak ada bangunan di kota {kota}")
+
+        logger.info(f"📥 Loaded {len(bld)} buildings for kota {kota}")
+
+        # 2) Persiapan columns
+        bld["jumlah_lantai"] = bld["jumlah_lantai"].fillna(0).astype(int)
+        bld["luas"]          = bld["luas"].fillna(0)
+        bld["hsbgn"]         = bld["hsbgn"].fillna(0)
+        coeff_map = {1:1.000,2:1.090,3:1.120,4:1.135,
+                     5:1.162,6:1.197,7:1.236,8:1.265}
+        floors = bld["jumlah_lantai"].clip(1,8)
+        bld["adjusted_hsbgn"] = bld["hsbgn"] * floors.map(coeff_map).fillna(1.0)
+
+        luas_arr  = bld["luas"].to_numpy()
+        hsbgn_arr = bld["adjusted_hsbgn"].to_numpy()
+
+        logger.debug("🔧 Prepared adjusted HSBGN and luas arrays")
+
+        # 3) Load semua disaster_data
+        disaster_data = get_all_disaster_data()
+        prefix_map = {"gempa":"mmi","banjir":"depth",
+                      "longsor":"mflux","gunungberapi":"kpa"}
+        scales_map = {
+            "gempa":["500","250","100"],
+            "banjir":["100","50","25"],
+            "longsor":["5","2"],
+            "gunungberapi":["250","100","50"]
+        }
+
+        # 4) Hitung direct_loss vectorized
+        for name, df_raw in disaster_data.items():
+            logger.info(f"⚙️ Processing hazard: {name}")
+            pre    = prefix_map[name]
+            scales = scales_map[name]
+            df = (
+                df_raw
+                .set_index("id_bangunan")
+                .reindex(bld["id_bangunan"], fill_value=0)
+                .reset_index(drop=True)
+            )
+            if name == "banjir":
+                floors_b = bld["jumlah_lantai"].clip(1,2).to_numpy()
+                for s in scales:
+                    y1 = df[f"nilai_y_1_{pre}{s}"].to_numpy()
+                    y2 = df[f"nilai_y_2_{pre}{s}"].to_numpy()
+                    v  = np.where(floors_b==1, y1, y2)
+                    bld[f"direct_loss_{name}_{s}"] = luas_arr * hsbgn_arr * v
+                    logger.debug(f"Calculated direct_loss_{name}_{s} for kota {kota}")
+            else:
+                for s in scales:
+                    ycols = [
+                        f"nilai_y_cr_{pre}{s}",
+                        f"nilai_y_mcf_{pre}{s}",
+                        f"nilai_y_mur_{pre}{s}",
+                        f"nilai_y_lightwood_{pre}{s}"
+                    ]
+                    maxv = df[ycols].to_numpy().max(axis=1)
+                    bld[f"direct_loss_{name}_{s}"] = luas_arr * hsbgn_arr * maxv
+                    logger.debug(f"Calculated direct_loss_{name}_{s} for kota {kota}")
+
+        # 5) Bulk insert DirectLoss
+        dl_cols = [c for c in bld.columns if c.startswith("direct_loss_")]
+        mappings = [
+            {"id_bangunan": row["id_bangunan"], **{c: float(row[c]) for c in dl_cols}}
+            for _, row in bld.iterrows()
+        ]
+        ids = bld["id_bangunan"].tolist()
+        logger.info(f"Deleting old DirectLoss for {len(ids)} bangunan")
+        db.session.query(HasilProsesDirectLoss) \
+            .filter(HasilProsesDirectLoss.id_bangunan.in_(ids)) \
+            .delete(synchronize_session=False)
+        logger.info(f"Inserting new DirectLoss records for kota {kota}")
+        db.session.bulk_insert_mappings(HasilProsesDirectLoss, mappings)
+        db.session.commit()
+
+        # 6) Hitung AAL per provinsi
+        prov = bld["provinsi"].iat[0]
+        bld["kode_bangunan"] = bld["id_bangunan"].str.split("_").str[0].str.lower()
+        grp = bld.groupby(["provinsi","kode_bangunan"])[dl_cols].sum().reset_index()
+        periods = {
+            "gempa_500":0.02,"gempa_250":0.04,"gempa_100":0.10,
+            "banjir_100":0.05,"banjir_50":0.10,"banjir_25":0.20,
+            "gunungberapi_250":0.01,"gunungberapi_100":0.03,"gunungberapi_50":0.05,
+            "longsor_5":0.02,"longsor_2":0.04
+        }
+        for key,p in periods.items():
+            dis,sc = key.split("_")
+            grp[f"aal_{dis}_{sc}"] = grp[f"direct_loss_{dis}_{sc}"] * (-np.log(1-p))
+        logger.info(f"Calculated AAL values for provinsi {prov}")
+
+        aal = grp.pivot(index="provinsi", columns="kode_bangunan")
+        aal.columns = [f"{col[0]}_{col[1]}" for col in aal.columns]
+        aal.reset_index(inplace=True)
+        for key in periods:
+            pref = f"aal_{key}_"
+            cols = [c for c in aal.columns if c.startswith(pref)]
+            aal[f"{pref}total"] = aal[cols].sum(axis=1)
+        aal.fillna(0, inplace=True)
+
+        logger.info(f"Updating AALProvinsi table for provinsi {prov}")
+        db.session.query(HasilAALProvinsi).filter_by(provinsi=prov).delete(synchronize_session=False)
+        db.session.bulk_insert_mappings(HasilAALProvinsi, aal.to_dict("records"))
+        db.session.commit()
+
+        # 7) Write CSV
+        out = os.path.join(DEBUG_DIR, f"batch_directloss_{kota}.csv")
+        bld.to_csv(out, index=False, sep=";")
+        logger.info(f"Wrote batch directloss CSV to {out}")
+
+        return out

@@ -10,6 +10,9 @@ from app.repository.repo_crud_bangunan import BangunanRepository
 from app.models.models_database import HasilProsesDirectLoss, HasilAALProvinsi
 from app.repository.repo_directloss import get_bangunan_data
 from app.service.service_directloss import recalc_building_directloss_and_aal  # << import baru
+from app.repository.repo_crud_bangunan import BangunanRepository
+from app.service.service_directloss import DisasterService
+
 
 class BangunanService:
     @staticmethod
@@ -165,3 +168,13 @@ class BangunanService:
             raise ValueError(f"Bangunan '{bangunan_id}' tidak ditemukan")
         # panggil service_directloss yang melakukan perhitungan ulang
         return recalc_building_directloss_and_aal(bangunan_id)
+    
+    @staticmethod
+    def recalc_by_kota(kota: str) -> str:
+        """
+        Rekalkulasi directloss & AAL untuk semua bangunan di `kota`.
+        """
+        return DisasterService.process_city_disasters(kota)
+    
+    
+    

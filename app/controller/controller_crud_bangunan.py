@@ -151,3 +151,23 @@ class BangunanController:
         except Exception as e:
             logger.error(f"Error recalc bangunan: {e}")
             return jsonify({"error": "Terjadi kesalahan perhitungan ulang"}), 500
+
+    @staticmethod
+    def recalc_by_kota():
+        kota = request.args.get('kota')
+        logger.info(f"API recalc_by_kota dipanggil untuk kota={kota}")
+        if not kota:
+            return jsonify({"error": "Parameter 'kota' wajib diberikan"}), 400
+
+        try:
+            csv_path = BangunanService.recalc_by_kota(kota)
+            logger.info(f"Recalc selesai untuk kota={kota}, hasil disimpan di {csv_path}")
+            return jsonify({
+                "status": "success",
+                "message": f"Recalc untuk kota {kota} selesai",
+                "file_path": csv_path
+            }), 200
+        except Exception as e:
+            logger.error(f"Error recalc_by_kota untuk kota={kota}: {e}")
+            return jsonify({"error": "Gagal melakukan recalc"}), 500
+

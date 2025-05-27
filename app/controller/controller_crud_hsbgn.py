@@ -1,6 +1,7 @@
 import logging
 from flask import request, jsonify
 from app.service.service_crud_hsbgn import HSBGNService
+from app.service.service_crud_bangunan import BangunanService  # tambahkan import
 
 # Konfigurasi Logging
 logging.basicConfig(level=logging.INFO)
@@ -43,11 +44,11 @@ class HSBGNController:
     def create():
         """Menambahkan HSBGN baru"""
         try:
-            data = request.json
+            data = request.json or {}
             required_fields = ["kota", "provinsi", "hsbgn"]
 
             # Validasi apakah semua field wajib ada
-            missing_fields = [field for field in required_fields if field not in data]
+            missing_fields = [f for f in required_fields if f not in data]
             if missing_fields:
                 return jsonify({"error": f"Kolom wajib tidak lengkap: {', '.join(missing_fields)}"}), 400
             
@@ -59,17 +60,28 @@ class HSBGNController:
 
     @staticmethod
     def update(hsbgn_id):
-        """Mengedit data HSBGN"""
+        """Mengedit data HSBGN dan langsung recalc bangunan di kota terkait."""
         try:
-            data = request.json
-            updated_hsbgn = HSBGNService.update_hsbgn(hsbgn_id, data)
-            if updated_hsbgn:
-                return jsonify(updated_hsbgn), 200
-            return jsonify({"error": "HSBGN tidak ditemukan"}), 404
+            data = request.json or {}
+            updated = HSBGNService.update_hsbgn(hsbgn_id, data)
+            if not updated:
+                return jsonify({"error": "HSBGN tidak ditemukan"}), 404
+
+            # trigger recalc untuk kota yang diperbarui
+            kota = updated.get("kota")
+            recalc_file = None
+            if kota:
+                recalc_file = BangunanService.recalc_by_kota(kota)
+
+            return jsonify({
+                "updated_hsbgn": updated,
+                "recalc_file": recalc_file
+            }), 200
+
         except Exception as e:
             loggerhsgbn.error(f"Error saat mengedit HSBGN ID {hsbgn_id}: {e}")
             return jsonify({"error": "Terjadi kesalahan server"}), 500
-
+        
     @staticmethod
     def delete(hsbgn_id):
         """Menghapus data HSBGN"""
@@ -81,7 +93,6 @@ class HSBGNController:
             loggerhsgbn.error(f"Error saat menghapus HSBGN ID {hsbgn_id}: {e}")
             return jsonify({"error": "Terjadi kesalahan server"}), 500
 
-    # Endpoint dropdown Provinsi & Kota
     @staticmethod
     def get_provinsi():
         """Mengambil daftar provinsi unik dari semua data HSBGN"""

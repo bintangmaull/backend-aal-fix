@@ -140,3 +140,17 @@ def get_all_disaster_data():
             all_data[name] = df
 
     return all_data
+
+def get_ids_by_kota(kota: str) -> list[str]:
+    """
+    Mengambil daftar id_bangunan untuk semua bangunan di `kota` tertentu.
+    """
+    sql = text("""
+        SELECT id_bangunan
+        FROM bangunan_copy
+        WHERE kota = :kota
+    """)
+    engine = get_db_connection()
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"kota": kota}).fetchall()
+    return [r[0] for r in rows]

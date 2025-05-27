@@ -50,3 +50,10 @@ bangunan_bp.add_url_rule(
     view_func=BangunanController.recalc,
     methods=["POST"]
 )
+
+# Endpoint batch recalc per kota
+bangunan_bp.add_url_rule(
+    "/recalc-by-kota",
+    view_func=BangunanController.recalc_by_kota,
+    methods=["POST"]
+)
