@@ -3,7 +3,6 @@
 from sqlalchemy import insert
 from app.models.models_database import Bangunan
 from app.extensions import db
-from app.repository.repo_directloss import get_ids_by_kota
 
 class BangunanRepository:
     # Daftar kolom non-geom untuk SELECT — ditambahkan jumlah_lantai
@@ -85,20 +84,23 @@ class BangunanRepository:
         INSERT record baru hanya untuk kolom non-geom.
         Postgres akan generate geom otomatis.
         """
+        # hanya ambil field yang sudah didefinisikan
         insert_data = {f: data[f] for f in BangunanRepository._fields if f in data}
         stmt = insert(Bangunan).values(**insert_data)
         db.session.execute(stmt)
         db.session.commit()
+        # kembalikan hasil SELECT tanpa geom
         return BangunanRepository.get_by_id(insert_data["id_bangunan"])
 
     @staticmethod
     def update(bangunan_id, data):
         """
-        UPDATE via ORM. geom akan di-recompute di DB.
+        UPDATE via ORM. geom akan di‐recompute di DB.
         """
         b = Bangunan.query.get(bangunan_id)
         if not b:
             return None
+        # jangan override id_bangunan atau geom
         data.pop("id_bangunan", None)
         data.pop("geom", None)
         for k, v in data.items():
@@ -118,19 +120,4 @@ class BangunanRepository:
         db.session.commit()
         return True
 
-    @staticmethod
-    def recalc_by_kota(kota: str) -> dict[str, dict]:
-        """
-        Untuk setiap bangunan di `kota`, panggil recalc_building_directloss_and_aal.
-        Kembalikan dict { id_bangunan: hasil_recalc }.
-        """
-        # lazy-import untuk menghindari circular dependency
-        from app.service.service_crud_bangunan import BangunanService
 
-        ids = get_ids_by_kota(kota)
-        results = {}
-        for bid in ids:
-            # panggil service yang sudah ada
-            res = BangunanService.recalc_building_directloss_and_aal(bid)
-            results[bid] = res
-        return results
